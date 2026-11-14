@@ -35,6 +35,14 @@ node install.cjs
 
 重启 DSH 生效。
 
+## 环境要求
+
+- **DeepSeek Harness**：已在 `0.2.2-rc.3` 上测试。插件依赖 `webServer` 与 `clientModules` API，低版本 DSH 若提供这些 API 也可正常工作。
+- **Node.js**：>= 18（插件本身与随包附带的 `install.cjs` 均仅使用 Node 内置模块）
+- **平台**：Windows / macOS / Linux
+  - Windows：使用系统自带的 PowerShell `Compress-Archive` 打包
+  - macOS / Linux：需系统提供 `zip` 命令
+
 ## 配置
 
 在 `cordis.patch.yml` 里：
