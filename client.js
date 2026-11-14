@@ -139,16 +139,20 @@ window.__ModuleLoader__.load({
       }
 
       function excludePlugin(name) {
-        showConfirm('排除插件', '确定要排除插件「' + name + '」吗？\n排除后将不再出现在列表中，但可在下方恢复。', function () {
-        fetch('/dsh-plugin-offline-sync/exclude', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: name, outputDir: outputDir || undefined }),
-        }).then(parseResp).then(function (d) {
-          if (d.ok) { setInfo('已排除: ' + name); load(); }
-          else setError(d.error || '排除失败');
-        }).catch(function (e) { setError(String(e)); });
-        }, '排除');
+        showConfirm('排除插件', '确定要排除插件「' + name + '」吗？\n排除后将不再出现在列表中，但可在下方恢复。', [
+          {
+            text: '排除', primary: true, danger: true, onClick: function () {
+              fetch('/dsh-plugin-offline-sync/exclude', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: name, outputDir: outputDir || undefined }),
+              }).then(parseResp).then(function (d) {
+                if (d.ok) { setInfo('已排除: ' + name); load(); }
+                else setError(d.error || '排除失败');
+              }).catch(function (e) { setError(String(e)); });
+            }
+          }
+        ]);
       }
 
       function restorePlugin(name) {
@@ -174,22 +178,28 @@ window.__ModuleLoader__.load({
       }
 
       function clearHistory() {
-        showConfirm('清除历史', '确定要清除历史打包记录吗？\n这将删除所有已生成的 ZIP 文件。\n（不会影响已安装的插件，也不会影响"有更新"检测状态）', function () {
-        setClearing(true); setError(''); setInfo('');
-        fetch('/dsh-plugin-offline-sync/clear-history', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ outputDir: outputDir || undefined }),
-        }).then(parseResp).then(function (d) {
-          setClearing(false);
-          if (d.ok) {
-            setInfo('已清除历史：删除 ' + (d.deleted || 0) + ' 个 ZIP 文件');
-            load();
-          } else {
-            setError(d.error || '清除失败');
-          }
-        }).catch(function (e) { setError(String(e)); setClearing(false); });
-        }, '清除');
+        function doClear(resetState) {
+          setClearing(true); setError(''); setInfo('');
+          fetch('/dsh-plugin-offline-sync/clear-history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ outputDir: outputDir || undefined, resetState: !!resetState }),
+          }).then(parseResp).then(function (d) {
+            setClearing(false);
+            if (d.ok) {
+              var msg = '已清除历史：删除 ' + (d.deleted || 0) + ' 个 ZIP 文件';
+              if (resetState && d.stateCleared) msg += '，已重置"有更新"检测状态';
+              setInfo(msg);
+              load();
+            } else {
+              setError(d.error || '清除失败');
+            }
+          }).catch(function (e) { setError(String(e)); setClearing(false); });
+        }
+        showConfirm('清除历史', '请选择清除方式：\n\n• 仅清除压缩包：删除所有已生成的 ZIP 文件，保留"有更新"检测状态\n• 清除全部记录：删除 ZIP 文件并重置"有更新"检测状态\n\n（不会影响已安装的插件）', [
+          { text: '仅清除压缩包', primary: true, onClick: function () { doClear(false); } },
+          { text: '清除全部记录', danger: true, onClick: function () { doClear(true); } }
+        ]);
       }
 
       function parseResp(r) {
@@ -203,14 +213,15 @@ window.__ModuleLoader__.load({
         return r.text().then(function (t) { throw new Error('非 JSON 响应: ' + (t.slice(0, 200) || '(空)')); });
       }
 
-      function showConfirm(title, desc, onConfirm, confirmText) {
+      function showConfirm(title, desc, actions) {
+        // actions: [{ text, primary?, onClick, danger? }]
         var overlay = document.createElement('div');
         overlay.className = 'dsh-sync-modal-overlay';
         overlay.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.5);display:flex;align-items:center;justify-content:center;z-index:2147483647;backdrop-filter:blur(2px);';
 
         var modal = document.createElement('div');
         modal.className = 'dsh-sync-modal';
-        modal.style.cssText = 'background:var(--dsw-alias-bg-module-platform,#fff);border-radius:16px;padding:24px;width:min(440px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.25);border:1px solid var(--dsw-alias-border-l2,#e2e8f0);';
+        modal.style.cssText = 'background:var(--dsw-alias-bg-module-platform,#fff);border-radius:16px;padding:24px;width:min(460px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.25);border:1px solid var(--dsw-alias-border-l2,#e2e8f0);';
         modal.onclick = function (e) { e.stopPropagation(); };
 
         var t = document.createElement('h3');
@@ -223,31 +234,37 @@ window.__ModuleLoader__.load({
         d.style.cssText = 'font-size:13px;color:var(--dsw-alias-label-tertiary,#64748b);margin:0 0 18px;line-height:1.6;white-space:pre-wrap;';
         modal.appendChild(d);
 
-        var actions = document.createElement('div');
-        actions.style.cssText = 'display:flex;justify-content:flex-end;gap:10px;';
-        modal.appendChild(actions);
+        var actionsBar = document.createElement('div');
+        actionsBar.style.cssText = 'display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;';
+        modal.appendChild(actionsBar);
 
-        function makeBtn(text, primary, onClick) {
+        function close() { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); }
+
+        function makeBtn(spec) {
           var b = document.createElement('button');
-          b.textContent = text;
+          b.textContent = spec.text;
           b.style.cssText = 'padding:8px 16px;border:1px solid var(--dsw-alias-border-l2,#e2e8f0);background:var(--dsw-alias-bg-module-platform,#fff);color:var(--dsw-alias-label-primary,#17212b);border-radius:10px;font-size:13px;cursor:pointer;transition:all .15s;white-space:nowrap;font-weight:500;';
-          if (primary) {
+          if (spec.primary) {
             b.style.background = 'var(--dsw-alias-brand-primary,#2563eb)';
             b.style.borderColor = 'var(--dsw-alias-brand-primary,#2563eb)';
             b.style.color = '#fff';
             b.style.fontWeight = '600';
             b.style.boxShadow = '0 2px 8px rgba(37,99,235,.3)';
           }
+          if (spec.danger) {
+            b.style.background = 'var(--dsw-alias-color-error,#dc2626)';
+            b.style.borderColor = 'var(--dsw-alias-color-error,#dc2626)';
+            b.style.color = '#fff';
+            b.style.fontWeight = '600';
+          }
           b.onmouseenter = function () { b.style.transform = 'translateY(-1px)'; };
           b.onmouseleave = function () { b.style.transform = ''; };
-          b.onclick = onClick;
+          b.onclick = function () { close(); if (spec.onClick) spec.onClick(); };
           return b;
         }
 
-        function close() { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); }
-
-        actions.appendChild(makeBtn('取消', false, close));
-        actions.appendChild(makeBtn(confirmText || '确定', true, function () { close(); onConfirm(); }));
+        actionsBar.appendChild(makeBtn({ text: '取消', onClick: null }));
+        (actions || []).forEach(function (a) { actionsBar.appendChild(makeBtn(a)); });
 
         overlay.onclick = close;
         overlay.appendChild(modal);

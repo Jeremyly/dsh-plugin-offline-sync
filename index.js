@@ -163,6 +163,26 @@ function savePackState(statePath, state) {
   writeFileSync(statePath, JSON.stringify(state, null, 2));
 }
 
+const EXCLUDED_FILE = 'excluded.json';
+
+/**
+ * Load the list of plugin names the user has excluded from the list.
+ * Stored next to the pack state so moving the output dir keeps it.
+ */
+function loadExcluded(outputDir) {
+  const p = join(outputDir, EXCLUDED_FILE);
+  if (!existsSync(p)) return [];
+  try {
+    const v = JSON.parse(readFileSync(p, 'utf8'));
+    return Array.isArray(v) ? v.filter(x => typeof x === 'string') : [];
+  } catch { return []; }
+}
+
+function saveExcluded(outputDir, list) {
+  mkdirSync(outputDir, { recursive: true });
+  writeFileSync(join(outputDir, EXCLUDED_FILE), JSON.stringify(list, null, 2));
+}
+
 /**
  * Recursively copy a directory, skipping node_modules and the packer state.
  */
@@ -555,22 +575,29 @@ export function apply(ctx, config) {
           const outputDir = defaultOutputDir();
           const statePath = join(outputDir, STATE_FILE);
           const state = loadPackState(statePath);
-          const enriched = plugins.map(p => {
-            const prev = state[p.name];
-            const fp = fingerprintDir(p.dir);
-            const changed = !prev || prev.fingerprint !== fp || prev.version !== p.version;
-            return {
-              name: p.name,
-              version: p.version,
-              description: p.description,
-              hasClient: p.hasClient,
-              hasBundle: p.hasBundle,
-              changed,
-              lastPackedAt: prev?.packedAt || null,
-              lastPackedVersion: prev?.version || null,
-            };
-          });
-          json(res, 200, { profile: prof, outputDir, plugins: enriched });
+          const excluded = loadExcluded(outputDir);
+          const excludedSet = new Set(excluded);
+          const enriched = plugins
+            .filter(p => !excludedSet.has(p.name))
+            .map(p => {
+              const prev = state[p.name];
+              const fp = fingerprintDir(p.dir);
+              const changed = !prev || prev.fingerprint !== fp || prev.version !== p.version;
+              return {
+                name: p.name,
+                version: p.version,
+                description: p.description,
+                hasClient: p.hasClient,
+                hasBundle: p.hasBundle,
+                changed,
+                lastPackedAt: prev?.packedAt || null,
+                lastPackedVersion: prev?.version || null,
+              };
+            });
+          const excludedPlugins = plugins
+            .filter(p => excludedSet.has(p.name))
+            .map(p => ({ name: p.name, version: p.version, description: p.description }));
+          json(res, 200, { profile: prof, outputDir, plugins: enriched, excluded: excludedPlugins });
         } catch (e) {
           json(res, 500, { error: String(e && e.message || e) });
         }
@@ -706,6 +733,91 @@ export function apply(ctx, config) {
           else if (process.platform === 'darwin') run('open', [outputDir]);
           else run('xdg-open', [outputDir]);
           json(res, 200, { outputDir });
+        } catch (e) {
+          json(res, 500, { error: String(e && e.message || e) });
+        }
+      },
+    }));
+
+    // POST /dsh-plugin-offline-sync/exclude — add a plugin to the exclude list.
+    // body: { name: string, outputDir?: string }
+    routes.push(webServer.register({
+      kind: 'exact',
+      path: '/dsh-plugin-offline-sync/exclude',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req);
+          const name = body && typeof body.name === 'string' ? body.name.trim() : '';
+          if (!name) { json(res, 400, { error: 'name required' }); return; }
+          const outputDir = body.outputDir || defaultOutputDir();
+          const list = loadExcluded(outputDir);
+          if (!list.includes(name)) list.push(name);
+          saveExcluded(outputDir, list);
+          json(res, 200, { ok: true, excluded: list });
+        } catch (e) {
+          json(res, 500, { error: String(e && e.message || e) });
+        }
+      },
+    }));
+
+    // POST /dsh-plugin-offline-sync/restore — remove plugin(s) from the exclude list.
+    // body: { name?: string, names?: string[], all?: boolean, outputDir?: string }
+    routes.push(webServer.register({
+      kind: 'exact',
+      path: '/dsh-plugin-offline-sync/restore',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req);
+          const outputDir = body.outputDir || defaultOutputDir();
+          let list = loadExcluded(outputDir);
+          if (body.all) {
+            list = [];
+          } else {
+            const toRemove = [];
+            if (body.name) toRemove.push(body.name);
+            if (Array.isArray(body.names)) toRemove.push(...body.names);
+            if (toRemove.length === 0) { json(res, 400, { error: 'name, names, or all required' }); return; }
+            list = list.filter(n => !toRemove.includes(n));
+          }
+          saveExcluded(outputDir, list);
+          json(res, 200, { ok: true, excluded: list });
+        } catch (e) {
+          json(res, 500, { error: String(e && e.message || e) });
+        }
+      },
+    }));
+
+    // POST /dsh-plugin-offline-sync/clear-history — delete generated ZIP archives.
+    // body: { outputDir?: string, resetState?: boolean }
+    //   resetState=false (default): only delete ZIP files, keep pack-state.json.
+    //   resetState=true: also delete pack-state.json so "changed" detection starts fresh.
+    routes.push(webServer.register({
+      kind: 'exact',
+      path: '/dsh-plugin-offline-sync/clear-history',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req);
+          const outputDir = (body && body.outputDir) || defaultOutputDir();
+          const resetState = !!(body && body.resetState);
+          if (!existsSync(outputDir)) {
+            json(res, 200, { ok: true, deleted: 0, stateCleared: false });
+            return;
+          }
+          let deleted = 0;
+          const entries = readdirSync(outputDir, { withFileTypes: true });
+          for (const ent of entries) {
+            if (ent.isFile() && /^dsh-plugins-.*\.zip$/i.test(ent.name)) {
+              try { rmSync(join(outputDir, ent.name), { force: true }); deleted++; } catch {}
+            }
+          }
+          let stateCleared = false;
+          if (resetState) {
+            const statePath = join(outputDir, STATE_FILE);
+            if (existsSync(statePath)) {
+              try { rmSync(statePath, { force: true }); stateCleared = true; } catch {}
+            }
+          }
+          json(res, 200, { ok: true, deleted, stateCleared });
         } catch (e) {
           json(res, 500, { error: String(e && e.message || e) });
         }
