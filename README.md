@@ -1,6 +1,6 @@
 # dsh-plugin-offline-sync
 
-将本地 DSH 插件打包为便携 ZIP，并在其他机器上安装。即使目标机器没装过本插件也能用。
+将本地 DSH 插件打包为便携 ZIP，并在其他机器上离线安装。即使目标机器没装过本插件也能用。
 
 ## 功能
 
@@ -9,9 +9,15 @@
 3. **目标机器版本检测** — 安装器逐个展示打包版本 vs 目标机器已安装版本，由用户决定是否更新。
 4. **目标机器无本插件也能装** — 安装器是独立的 `install.cjs`，只依赖 Node 内置模块，不需要 DSH 运行时。
 
+## 安装
+
+```bash
+dsh plugin add Jeremyly/dsh-plugin-offline-sync
+```
+
 ## 打包流程
 
-设置 → Plugins → 打包同步 → 勾选插件 → 打包选中 → 输出目录生成 `dsh-plugins-<时间戳>.zip`。
+设置 → Plugins → 离线打包同步 → 勾选插件 → 打包选中 → 输出目录生成 `dsh-plugins-<时间戳>.zip`。
 
 ## 安装流程（目标机器）
 
@@ -39,5 +45,9 @@ node install.cjs
       name: 'dsh-plugin-offline-sync'
       config:
         profile: desktop
-        outputDir: 'C:\path\to\output'   # 可选，默认 <profile>/dsh-plugin-offline-sync-output
+        outputDir: 'C:\\path\\to\\output'   # 可选，默认 <profile>/dsh-plugin-offline-sync-output
 ```
+
+## License
+
+MIT
