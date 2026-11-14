@@ -41,6 +41,16 @@ window.__ModuleLoader__.load({
         '.dsh-sync-item.selected{border-color:var(--dsw-alias-brand-primary,#2563eb);background:linear-gradient(135deg,rgba(37,99,235,.06),rgba(124,58,237,.04));box-shadow:0 6px 16px rgba(37,99,235,.15)}',
         '.dsh-sync-item.selected::after{content:"✓";position:absolute;top:14px;right:14px;width:22px;height:22px;border-radius:50%;background:var(--dsw-alias-brand-primary,#2563eb);color:#fff;font-size:13px;display:flex;align-items:center;justify-content:center;font-weight:700}',
         '.dsh-sync-item input[type=checkbox]{position:absolute;top:18px;left:16px;width:18px;height:18px;accent-color:var(--dsw-alias-brand-primary,#2563eb);cursor:pointer;z-index:1}',
+        '.dsh-sync-exclude-btn{position:absolute;top:14px;right:14px;background:transparent;border:none;color:var(--dsw-alias-label-tertiary,#94a3b8);cursor:pointer;font-size:14px;padding:4px;border-radius:6px;line-height:1;opacity:0;transition:opacity .15s,color .15s,background .15s}',
+        '.dsh-sync-item:hover .dsh-sync-exclude-btn{opacity:1}',
+        '.dsh-sync-exclude-btn:hover{color:var(--dsw-alias-color-error,#dc2626);background:rgba(239,68,68,.1)}',
+        '.dsh-sync-excluded-section{margin-top:18px;padding-top:16px;border-top:1px dashed var(--dsw-alias-border-l2,#e2e8f0)}',
+        '.dsh-sync-excluded-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-tertiary,#64748b);margin:0 0 10px;display:flex;align-items:center;justify-content:space-between}',
+        '.dsh-sync-excluded-list{display:flex;flex-wrap:wrap;gap:8px}',
+        '.dsh-sync-excluded-tag{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border:1px solid var(--dsw-alias-border-l2,#e2e8f0);border-radius:999px;background:var(--dsw-alias-bg-module-sub,#f9fafb);font-size:12px;color:var(--dsw-alias-label-secondary,#475569)}',
+        '.dsh-sync-excluded-tag button{background:none;border:none;color:var(--dsw-alias-brand-primary,#2563eb);cursor:pointer;font-size:12px;padding:0;font-weight:600}',
+        '.dsh-sync-excluded-tag button:hover{text-decoration:underline}',
+        '.dsh-sync-clearing{opacity:.6;pointer-events:none}',
         '.dsh-sync-item-main{min-width:0}',
         '.dsh-sync-item-name{font-weight:700;font-size:15px;color:var(--dsw-alias-label-primary,#17212b);display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:2px}',
         '.dsh-sync-badge{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--dsw-alias-bg-tag,#e5e7eb);color:var(--dsw-alias-label-tertiary,#64748b);font-weight:600}',
@@ -67,6 +77,7 @@ window.__ModuleLoader__.load({
       var _e = React.useState(''), error = _e[0], setError = _e[1];
       var _f = React.useState(''), info = _f[0], setInfo = _f[1];
       var _g = React.useState(false), packing = _g[0], setPacking = _g[1];
+      var _h = React.useState(false), clearing = _h[0], setClearing = _h[1];
 
       React.useEffect(function () { ensureStyles(); load(); }, []);
 
@@ -127,6 +138,122 @@ window.__ModuleLoader__.load({
         fetch('/dsh-plugin-offline-sync/open-output').catch(function () {});
       }
 
+      function excludePlugin(name) {
+        showConfirm('排除插件', '确定要排除插件「' + name + '」吗？\n排除后将不再出现在列表中，但可在下方恢复。', function () {
+        fetch('/dsh-plugin-offline-sync/exclude', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, outputDir: outputDir || undefined }),
+        }).then(parseResp).then(function (d) {
+          if (d.ok) { setInfo('已排除: ' + name); load(); }
+          else setError(d.error || '排除失败');
+        }).catch(function (e) { setError(String(e)); });
+        }, '排除');
+      }
+
+      function restorePlugin(name) {
+        fetch('/dsh-plugin-offline-sync/restore', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, outputDir: outputDir || undefined }),
+        }).then(parseResp).then(function (d) {
+          if (d.ok) { setInfo('已恢复: ' + name); load(); }
+          else setError(d.error || '恢复失败');
+        }).catch(function (e) { setError(String(e)); });
+      }
+
+      function restoreAll() {
+        fetch('/dsh-plugin-offline-sync/restore', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ all: true, outputDir: outputDir || undefined }),
+        }).then(parseResp).then(function (d) {
+          if (d.ok) { setInfo('已恢复全部排除的插件'); load(); }
+          else setError(d.error || '恢复失败');
+        }).catch(function (e) { setError(String(e)); });
+      }
+
+      function clearHistory() {
+        showConfirm('清除历史', '确定要清除历史打包记录吗？\n这将删除所有已生成的 ZIP 文件。\n（不会影响已安装的插件，也不会影响"有更新"检测状态）', function () {
+        setClearing(true); setError(''); setInfo('');
+        fetch('/dsh-plugin-offline-sync/clear-history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ outputDir: outputDir || undefined }),
+        }).then(parseResp).then(function (d) {
+          setClearing(false);
+          if (d.ok) {
+            setInfo('已清除历史：删除 ' + (d.deleted || 0) + ' 个 ZIP 文件');
+            load();
+          } else {
+            setError(d.error || '清除失败');
+          }
+        }).catch(function (e) { setError(String(e)); setClearing(false); });
+        }, '清除');
+      }
+
+      function parseResp(r) {
+        var ct = r.headers.get('content-type') || '';
+        if (!r.ok) {
+          return r.text().then(function (t) {
+            throw new Error('HTTP ' + r.status + (t ? ': ' + t : ''));
+          });
+        }
+        if (ct.indexOf('application/json') !== -1) return r.json();
+        return r.text().then(function (t) { throw new Error('非 JSON 响应: ' + (t.slice(0, 200) || '(空)')); });
+      }
+
+      function showConfirm(title, desc, onConfirm, confirmText) {
+        var overlay = document.createElement('div');
+        overlay.className = 'dsh-sync-modal-overlay';
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.5);display:flex;align-items:center;justify-content:center;z-index:2147483647;backdrop-filter:blur(2px);';
+
+        var modal = document.createElement('div');
+        modal.className = 'dsh-sync-modal';
+        modal.style.cssText = 'background:var(--dsw-alias-bg-module-platform,#fff);border-radius:16px;padding:24px;width:min(440px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.25);border:1px solid var(--dsw-alias-border-l2,#e2e8f0);';
+        modal.onclick = function (e) { e.stopPropagation(); };
+
+        var t = document.createElement('h3');
+        t.textContent = title;
+        t.style.cssText = 'font-size:16px;font-weight:700;margin:0 0 8px;color:var(--dsw-alias-label-primary,#17212b);';
+        modal.appendChild(t);
+
+        var d = document.createElement('p');
+        d.textContent = desc;
+        d.style.cssText = 'font-size:13px;color:var(--dsw-alias-label-tertiary,#64748b);margin:0 0 18px;line-height:1.6;white-space:pre-wrap;';
+        modal.appendChild(d);
+
+        var actions = document.createElement('div');
+        actions.style.cssText = 'display:flex;justify-content:flex-end;gap:10px;';
+        modal.appendChild(actions);
+
+        function makeBtn(text, primary, onClick) {
+          var b = document.createElement('button');
+          b.textContent = text;
+          b.style.cssText = 'padding:8px 16px;border:1px solid var(--dsw-alias-border-l2,#e2e8f0);background:var(--dsw-alias-bg-module-platform,#fff);color:var(--dsw-alias-label-primary,#17212b);border-radius:10px;font-size:13px;cursor:pointer;transition:all .15s;white-space:nowrap;font-weight:500;';
+          if (primary) {
+            b.style.background = 'var(--dsw-alias-brand-primary,#2563eb)';
+            b.style.borderColor = 'var(--dsw-alias-brand-primary,#2563eb)';
+            b.style.color = '#fff';
+            b.style.fontWeight = '600';
+            b.style.boxShadow = '0 2px 8px rgba(37,99,235,.3)';
+          }
+          b.onmouseenter = function () { b.style.transform = 'translateY(-1px)'; };
+          b.onmouseleave = function () { b.style.transform = ''; };
+          b.onclick = onClick;
+          return b;
+        }
+
+        function close() { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); }
+
+        actions.appendChild(makeBtn('取消', false, close));
+        actions.appendChild(makeBtn(confirmText || '确定', true, function () { close(); onConfirm(); }));
+
+        overlay.onclick = close;
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+      }
+
       function openDirDialog() {
         var overlay = document.createElement('div');
         overlay.className = 'dsh-sync-modal-overlay';
@@ -184,6 +311,7 @@ window.__ModuleLoader__.load({
           return b;
         }
 
+        actions.appendChild(makeBtn('打开目录', false, openOutput));
         actions.appendChild(makeBtn('取消', false, doClose));
         actions.appendChild(makeBtn('确定', true, doConfirm));
 
@@ -227,6 +355,11 @@ window.__ModuleLoader__.load({
             ),
             h('div', { className: 'dsh-sync-toolbar-right' },
               h('span', { className: 'dsh-sync-count' }, '已选 ', h('b', null, count), ' 个插件'),
+              h('button', {
+                className: 'dsh-sync-btn' + (clearing ? ' dsh-sync-clearing' : ''),
+                onClick: clearHistory,
+                disabled: clearing
+              }, clearing ? '清除中...' : '🗑 清除历史'),
               h('button', { className: 'dsh-sync-btn', onClick: openDirDialog }, '📁 输出目录'),
               h('button', {
                 onClick: pack,
@@ -250,6 +383,11 @@ window.__ModuleLoader__.load({
                 className: 'dsh-sync-item' + (checked ? ' selected' : '')
               },
                 h('input', { type: 'checkbox', checked: checked, onChange: function () {} }),
+                h('button', {
+                  className: 'dsh-sync-exclude-btn',
+                  title: '排除此插件',
+                  onClick: function (e) { e.stopPropagation(); excludePlugin(p.name); }
+                }, '⊘'),
                 h('div', { className: 'dsh-sync-item-main' },
                   h('div', { className: 'dsh-sync-item-name' },
                     p.name,
@@ -261,6 +399,25 @@ window.__ModuleLoader__.load({
               );
             })
           ),
+
+          (function () {
+            var excluded = (data && data.excluded) || [];
+            if (excluded.length === 0) return null;
+            return h('div', { className: 'dsh-sync-excluded-section' },
+              h('div', { className: 'dsh-sync-excluded-title' },
+                h('span', null, '已排除的插件（' + excluded.length + '）'),
+                h('button', { className: 'dsh-sync-btn', style: { padding: '4px 10px', fontSize: '12px' }, onClick: restoreAll }, '全部恢复')
+              ),
+              h('div', { className: 'dsh-sync-excluded-list' },
+                excluded.map(function (p) {
+                  return h('span', { key: p.name, className: 'dsh-sync-excluded-tag' },
+                    p.name + (p.version ? ' @' + p.version : ''),
+                    h('button', { onClick: function () { restorePlugin(p.name); } }, '恢复')
+                  );
+                })
+              )
+            );
+          })()
 
         ),
 
