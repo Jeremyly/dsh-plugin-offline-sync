@@ -1,0 +1,48 @@
+{
+  "name": "dsh-plugin-offline-sync",
+  "version": "0.1.0",
+  "description": "Package local DSH plugins into a portable ZIP and install them offline on other machines. / 将本地 DSH 插件打包为可便携的 ZIP，在其他机器上离线安装。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "offline",
+    "sync",
+    "package",
+    "deploy",
+    "离线",
+    "打包",
+    "同步"
+  ],
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/",
+    "assets/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

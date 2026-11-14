@@ -1,0 +1,7 @@
+# dsh-plugin-offline-sync bundle patch: self-insert so the loader enables the
+# plugin row when this package is added to a profile (dsh plugin add).
+- insert:
+    - id: dsh-plugin-offline-sync
+      name: 'dsh-plugin-offline-sync'
+      config:
+        profile: desktop
