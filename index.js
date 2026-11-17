@@ -228,9 +228,38 @@ function run(cmd, args, opts = {}) {
   return {
     ok: r.status === 0,
     stdout: r.stdout || '',
-    stderr: r.stderr || '',
+    stderr: r.stderr || (r.error ? r.error.message : ''),
     exitCode: r.status,
   };
+}
+
+/**
+ * Copy a list of absolute file paths to the system clipboard as files
+ * (so the user can paste them into a folder / chat / file picker).
+ *
+ * Windows: PowerShell `Set-Clipboard -LiteralPath` accepts multiple paths.
+ * macOS: `osascript` tells Finder to set the clipboard to POSIX file refs.
+ * Linux: try `xclip` with text/uri-list; fall back to `xsel` with plain paths.
+ * Returns the run() result object so the caller can report failures.
+ */
+function copyFilesToClipboard(files) {
+  if (process.platform === 'win32') {
+    const list = files.map(f => "'" + f.replace(/'/g, "''") + "'").join(',');
+    return run('powershell', [
+      '-NoProfile', '-Command',
+      'Set-Clipboard -LiteralPath @(' + list + ')',
+    ]);
+  }
+  if (process.platform === 'darwin') {
+    const list = files.map(f => 'POSIX file "' + f.replace(/"/g, '\\"') + '"').join(', ');
+    return run('osascript', ['-e', 'tell application "Finder" to set the clipboard to {' + list + '}']);
+  }
+  // Linux: prefer xclip with the text/uri-list target (file-paste friendly).
+  const uriList = files.map(f => 'file://' + f).join('\n') + '\n';
+  const xc = run('xclip', ['-selection', 'clipboard', '-t', 'text/uri-list'], { input: uriList });
+  if (xc.ok) return xc;
+  const xs = run('xsel', ['--clipboard', '--input'], { input: files.join('\n') });
+  return xs.ok ? xs : xc;
 }
 
 /**
@@ -691,6 +720,7 @@ export function apply(ctx, config) {
       kind: 'exact',
       path: '/dsh-plugin-offline-sync/pack',
       handler: async (req, res) => {
+        let stage = null;
         try {
           const body = await readBody(req);
           const names = Array.isArray(body.names) ? body.names : [];
@@ -719,7 +749,7 @@ export function apply(ctx, config) {
 
           // Build staging dir.
           const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const stage = join(outputDir, '.stage-' + stamp);
+          stage = join(outputDir, '.stage-' + stamp);
           if (existsSync(stage)) rmSync(stage, { recursive: true, force: true });
           mkdirSync(stage, { recursive: true });
 
@@ -784,8 +814,6 @@ export function apply(ctx, config) {
           if (existsSync(zipPath)) rmSync(zipPath, { force: true });
 
           const zr = zipDirectory(stage, zipPath);
-          // Clean up stage regardless.
-          try { rmSync(stage, { recursive: true, force: true }); } catch {}
 
           if (!zr.ok) {
             json(res, 500, { error: 'zip failed', stderr: zr.stderr, stdout: zr.stdout });
@@ -820,6 +848,10 @@ export function apply(ctx, config) {
           });
         } catch (e) {
           json(res, 500, { error: String(e && e.stack || e) });
+        } finally {
+          if (stage) {
+            try { rmSync(stage, { recursive: true, force: true }); } catch {}
+          }
         }
       },
     }));
@@ -834,6 +866,57 @@ export function apply(ctx, config) {
           if (!cm) { json(res, 200, { error: 'no clientModules service' }); return; }
           const graph = cm.graph();
           json(res, 200, { graph });
+        } catch (e) {
+          json(res, 500, { error: String(e && e.stack || e) });
+        }
+      },
+    }));
+
+    // POST /dsh-plugin-offline-sync/copy-last — copy the most recent ZIP archive
+    // (and its same-basename .txt packing list) to the system clipboard.
+    // body: { outputDir?: string }
+    routes.push(webServer.register({
+      kind: 'exact',
+      path: '/dsh-plugin-offline-sync/copy-last',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req);
+          const outputDir = (body && body.outputDir) || defaultOutputDir();
+          if (!existsSync(outputDir)) {
+            json(res, 404, { error: 'output directory does not exist' });
+            return;
+          }
+          const entries = readdirSync(outputDir, { withFileTypes: true });
+          const zips = entries
+            .filter(e => e.isFile() && /^dsh-plugins-.*\.zip$/i.test(e.name))
+            .map(e => {
+              let mtime = 0;
+              try { mtime = statSync(join(outputDir, e.name)).mtimeMs; } catch {}
+              return { name: e.name, mtime };
+            })
+            .sort((a, b) => b.mtime - a.mtime);
+          if (zips.length === 0) {
+            json(res, 404, { error: 'no packed ZIP found' });
+            return;
+          }
+          const latest = zips[0];
+          const zipPath = join(outputDir, latest.name);
+          const txtName = latest.name.replace(/\.zip$/i, '') + '.txt';
+          const txtPath = join(outputDir, txtName);
+          const files = [zipPath];
+          const hasTxt = existsSync(txtPath);
+          if (hasTxt) files.push(txtPath);
+          const cr = copyFilesToClipboard(files);
+          if (!cr.ok) {
+            json(res, 500, { error: 'clipboard copy failed', stdout: cr.stdout, stderr: cr.stderr, platform: process.platform });
+            return;
+          }
+          json(res, 200, {
+            ok: true,
+            zipName: latest.name,
+            txtName: hasTxt ? txtName : null,
+            files,
+          });
         } catch (e) {
           json(res, 500, { error: String(e && e.stack || e) });
         }

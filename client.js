@@ -77,6 +77,7 @@ window.__ModuleLoader__.load({
       var _f = React.useState(''), info = _f[0], setInfo = _f[1];
       var _g = React.useState(false), packing = _g[0], setPacking = _g[1];
       var _h = React.useState(false), clearing = _h[0], setClearing = _h[1];
+      var _i = React.useState(false), copying = _i[0], setCopying = _i[1];
 
       React.useEffect(function () { ensureStyles(); load(); }, []);
 
@@ -135,6 +136,24 @@ window.__ModuleLoader__.load({
 
       function openOutput() {
         fetch('/dsh-plugin-offline-sync/open-output').catch(function () {});
+      }
+
+      function copyLast() {
+        setCopying(true); setError(''); setInfo('');
+        fetch('/dsh-plugin-offline-sync/copy-last', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ outputDir: outputDir || undefined }),
+        }).then(parseResp).then(function (d) {
+          setCopying(false);
+          if (d.ok) {
+            var msg = '已复制最近的打包结果到剪贴板：\n' + d.zipName;
+            if (d.txtName) msg += '\n' + d.txtName;
+            setInfo(msg);
+          } else {
+            setError(d.error || '复制失败');
+          }
+        }).catch(function (e) { setError(String(e)); setCopying(false); });
       }
 
       function excludePlugin(name) {
@@ -376,6 +395,11 @@ window.__ModuleLoader__.load({
                 onClick: clearHistory,
                 disabled: clearing
               }, clearing ? '清除中...' : '🗑 清除历史'),
+              h('button', {
+                className: 'dsh-sync-btn' + (copying ? ' dsh-sync-clearing' : ''),
+                onClick: copyLast,
+                disabled: copying
+              }, copying ? '复制中...' : '📋 复制最近结果'),
               h('button', { className: 'dsh-sync-btn', onClick: openDirDialog }, '📁 输出目录'),
               h('button', {
                 onClick: pack,
