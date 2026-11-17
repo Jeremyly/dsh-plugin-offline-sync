@@ -682,6 +682,15 @@ export function apply(ctx, config) {
             return;
           }
 
+          // Write a packing list (.txt) with the same basename as the ZIP,
+          // containing each plugin's name and version.
+          const listName = zipName.replace(/\.zip$/i, '') + '.txt';
+          const listPath = join(outputDir, listName);
+          const listContent = manifestPlugins
+            .map(p => p.name + ' ' + p.version)
+            .join('\n') + '\n';
+          writeFileSync(listPath, listContent, 'utf8');
+
           // Update pack state.
           for (const p of selected) {
             state[p.name] = {
@@ -806,7 +815,7 @@ export function apply(ctx, config) {
           let deleted = 0;
           const entries = readdirSync(outputDir, { withFileTypes: true });
           for (const ent of entries) {
-            if (ent.isFile() && /^dsh-plugins-.*\.zip$/i.test(ent.name)) {
+            if (ent.isFile() && /^dsh-plugins-.*\.(zip|txt)$/i.test(ent.name)) {
               try { rmSync(join(outputDir, ent.name), { force: true }); deleted++; } catch {}
             }
           }
