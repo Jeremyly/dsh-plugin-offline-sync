@@ -206,6 +206,21 @@ function copyPluginDir(src, dest) {
 }
 
 /**
+ * Recursively copy a directory WITHOUT skipping node_modules. Used for the
+ * billion-context runtime payload (which MUST include its node_modules).
+ */
+function copyRecursive(src, dest) {
+  mkdirSync(dest, { recursive: true });
+  for (const ent of readdirSync(src, { withFileTypes: true })) {
+    if (ent.name === STATE_FILE) continue;
+    const sf = join(src, ent.name);
+    const df = join(dest, ent.name);
+    if (ent.isDirectory()) copyRecursive(sf, df);
+    else if (ent.isFile()) copyFileSync(sf, df);
+  }
+}
+
+/**
  * Run a command synchronously, returning {ok, stdout, stderr, exitCode}.
  */
 function run(cmd, args, opts = {}) {
@@ -251,7 +266,7 @@ const INSTALLER_TEMPLATE = String.raw`#!/usr/bin/env node
  * dsh-plugin-offline-sync standalone installer.
  *
  * Usage:
- *   node install.cjs [--profile <name>] [--yes] [--list]
+ *   node install.cjs [--profile <name>] [--yes] [--confirm] [--list] [--skip-bili]
  *
  * Defaults to the 'desktop' profile (configurable; user said it's fixed).
  * Works even when dsh-plugin-offline-sync is NOT installed on the target machine —
@@ -269,7 +284,9 @@ const hasFlag = (name) => args.includes(name);
 
 const PROFILE = getArg('--profile') || 'desktop';
 const AUTO_YES = hasFlag('--yes');
+const CONFIRM_EACH = hasFlag('--confirm');
 const LIST_ONLY = hasFlag('--list');
+const SKIP_BILI = hasFlag('--skip-bili');
 
 function homeDir() {
   return process.env.DSH_HOME
@@ -334,36 +351,47 @@ function cmpVersion(a, b) {
 function ask(question, choices) {
   if (AUTO_YES) return choices[0];
   process.stdout.write(question);
-  const buf = Buffer.alloc(1024);
-  const r = fs.readSync(0, buf, 0, 1024, null);
-  return buf.toString('utf8', 0, r).trim().toLowerCase();
+  // Read one byte at a time until newline/EOF so each answer is consumed
+  // independently of how the input is buffered (pipe vs interactive TTY).
+  let line = '';
+  const buf = Buffer.alloc(1);
+  while (true) {
+    let r;
+    try { r = fs.readSync(0, buf, 0, 1, null); } catch { r = 0; }
+    if (r === 0) break;
+    const ch = buf.toString('utf8', 0, r);
+    if (ch === '\n') break;
+    if (ch === '\r') continue;
+    line += ch;
+  }
+  return line.trim().toLowerCase();
 }
 
 function main() {
   const here = __dirname;
   const manifest = readJson(path.join(here, 'manifest.json'));
   if (!manifest) {
-    console.error('[dsh-plugin-offline-sync] manifest.json not found next to install.cjs');
+    console.error('[dsh-plugin-offline-sync] 未找到与 install.cjs 同级的 manifest.json');
     process.exit(1);
   }
 
   const profile = profileDir(PROFILE);
   if (!fs.existsSync(path.join(profile, 'package.json'))) {
-    console.error('[dsh-plugin-offline-sync] target profile not found: ' + profile);
-    console.error('  Pass --profile <name> or set DSH_PROFILE_DIR.');
+    console.error('[dsh-plugin-offline-sync] 目标 profile 不存在: ' + profile);
+    console.error('  请使用 --profile <名称> 指定，或设置 DSH_PROFILE_DIR。');
     process.exit(1);
   }
 
   const plugins = manifest.plugins || [];
-  console.log('[dsh-plugin-offline-sync] profile: ' + profile);
-  console.log('[dsh-plugin-offline-sync] packaged at: ' + (manifest.packedAt || '?'));
-  console.log('[dsh-plugin-offline-sync] ' + plugins.length + ' plugin(s) in this pack');
+  console.log('[dsh-plugin-offline-sync] profile 目录: ' + profile);
+  console.log('[dsh-plugin-offline-sync] 打包时间: ' + (manifest.packedAt || '?'));
+  console.log('[dsh-plugin-offline-sync] 本包包含 ' + plugins.length + ' 个插件');
   console.log('');
 
   if (LIST_ONLY) {
     for (const p of plugins) {
       const tv = targetVersion(profile, p.name);
-      const status = tv ? 'installed ' + tv : 'not installed';
+      const status = tv ? '已安装 ' + tv : '未安装';
       console.log('  ' + p.name + '  pack=' + p.version + '  target=' + status);
     }
     return;
@@ -377,22 +405,32 @@ function main() {
     let cmp = null;
     if (tv) cmp = cmpVersion(p.version, tv);
     console.log('--- ' + p.name + ' ---');
-    console.log('  packed version:   ' + p.version);
-    console.log('  installed:        ' + (tv ? tv : '(not installed)'));
-    if (cmp === -1) console.log('  → packed is OLDER than installed');
-    else if (cmp === 1) console.log('  → packed is NEWER than installed');
-    else if (cmp === 0) console.log('  → same version');
-    else if (!hasIt) console.log('  → will be freshly installed');
+    console.log('  打包版本:   ' + p.version);
+    console.log('  已安装版本: ' + (tv ? tv : '(未安装)'));
+    if (cmp === -1) console.log('  → 打包版本比已安装版本旧');
+    else if (cmp === 1) console.log('  → 打包版本比已安装版本新');
+    else if (cmp === 0) console.log('  → 版本相同');
+    else if (!hasIt) console.log('  → 将全新安装');
 
     let choice;
-    if (AUTO_YES) choice = 'y';
-    else {
-      choice = ask('  Install/overwrite? [y/N/s(ame-only/q)] ', ['y']);
+    if (AUTO_YES) {
+      choice = 'y';
+    } else if (CONFIRM_EACH) {
+      // User explicitly asked to confirm every plugin.
+      choice = ask('  安装/覆盖？[y/N/q]  y=安装  N=跳过(默认)  q=退出剩余  ', ['y']);
+    } else {
+      // Default: install when the packed version is newer, or when the
+      // plugin isn't installed yet. Skip same/older versions silently.
+      if (!hasIt || cmp === 1) {
+        choice = 'y';
+        console.log('  → 自动安装（版本更新或新增）');
+      } else {
+        choice = 'n';
+        console.log('  → 跳过（版本相同或更旧；使用 --confirm 可逐个确认）');
+      }
     }
     if (choice === 'q') { decisions.push({ name: p.name, action: 'skip' }); break; }
     if (choice === 'y' || choice === 'yes') {
-      decisions.push({ name: p.name, action: 'install' });
-    } else if (choice === 's' && cmp === 0) {
       decisions.push({ name: p.name, action: 'install' });
     } else {
       decisions.push({ name: p.name, action: 'skip' });
@@ -401,11 +439,11 @@ function main() {
 
   const toInstall = decisions.filter(d => d.action === 'install').map(d => d.name);
   if (toInstall.length === 0) {
-    console.log('\\n[dsh-plugin-offline-sync] nothing to install.');
+    console.log('\\n[dsh-plugin-offline-sync] 没有需要安装的插件。');
     return;
   }
 
-  console.log('\\n[dsh-plugin-offline-sync] installing: ' + toInstall.join(', '));
+  console.log('\\n[dsh-plugin-offline-sync] 正在安装: ' + toInstall.join(', '));
 
   const profilePkgPath = path.join(profile, 'package.json');
   const profilePkg = readJson(profilePkgPath) || { name: 'profile', dependencies: {} };
@@ -421,13 +459,13 @@ function main() {
     const src = path.join(here, 'plugins', name);
     const dest = path.join(nmDir, name);
     if (!fs.existsSync(src)) {
-      console.error('  [skip] ' + name + ': not found in pack');
+      console.error('  [跳过] ' + name + ': 包中未找到该插件');
       continue;
     }
     if (fs.existsSync(dest)) {
       try { fs.rmSync(dest, { recursive: true, force: true }); }
       catch (e) {
-        console.error('  [skip] ' + name + ': cannot remove old copy: ' + e.message);
+        console.error('  [跳过] ' + name + ': 无法删除旧版本: ' + e.message);
         continue;
       }
     }
@@ -439,7 +477,7 @@ function main() {
     if (!profilePkg.dsh.profile.bundles.includes(name)) {
       profilePkg.dsh.profile.bundles.push(name);
     }
-    console.log('  [ok] ' + name + '@' + (newPkg.version || '?'));
+    console.log('  [完成] ' + name + '@' + (newPkg.version || '?'));
   }
 
   // Merge cordis.patch.yml entries from the pack into the target patch file.
@@ -472,12 +510,44 @@ function main() {
     if (toAdd.length) {
       const merged = (existing.endsWith('\n') ? existing : existing + '\n') + toAdd.join('\n') + '\n';
       fs.writeFileSync(destPatch, merged);
-      console.log('  [ok] merged ' + toAdd.length + ' patch block(s) into cordis.patch.yml');
+      console.log('  [完成] 已合并 ' + toAdd.length + ' 个补丁块到 cordis.patch.yml');
     }
   }
 
   writeJson(profilePkgPath, profilePkg);
-  console.log('\\n[dsh-plugin-offline-sync] done. Restart DSH (or reload the profile) to activate the plugins.');
+
+  // --- billion-context locally-runnable program sync update ---
+  if (!SKIP_BILI && toInstall.includes('billion-context')) {
+    const biliDir = path.join(here, 'runtime', 'billion-context');
+    const biliPayload = path.join(biliDir, 'payload', 'node_modules', 'billion-context', 'dist', 'index.js');
+    const biliUpdate = path.join(biliDir, 'update.ps1');
+    if (fs.existsSync(biliPayload) && fs.existsSync(biliUpdate)) {
+      const biliRuntime = readJson(path.join(biliDir, 'runtime.json')) || {};
+      console.log('');
+      console.log('[billion-context] 正在更新本地可运行程序到 ' + (biliRuntime.version || '?') +
+        (biliRuntime.commit ? ' (' + biliRuntime.commit + ')' : ''));
+      if (process.platform === 'win32') {
+        const { spawnSync } = require('child_process');
+        const r = spawnSync('powershell', [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', biliUpdate,
+          '-PayloadDir', path.join(biliDir, 'payload'),
+          '-SkipPrompt', '-NoSmokeTest',
+        ], { stdio: 'inherit' });
+        if (r.status !== 0) {
+          console.error('[billion-context] update.ps1 退出码 ' + r.status +
+            '. The plugin itself was installed; you can retry manually:');
+          console.error('  powershell -File "' + biliUpdate + '" -PayloadDir "' +
+            path.join(biliDir, 'payload') + '"');
+        }
+      } else {
+        console.log('[billion-context] 运行时更新仅支持 Windows（update.ps1），当前平台跳过。');
+      }
+    } else {
+      console.log('[billion-context] 包中未找到运行时 payload，跳过本地可运行程序更新。');
+    }
+  }
+
+  console.log('\\n[dsh-plugin-offline-sync] 完成。请重启 DSH（或重新加载 profile）使插件生效。');
 }
 
 main();
@@ -503,15 +573,17 @@ node install.cjs
 The installer will:
 1. Locate your DSH profile (default: \`desktop\`; override with \`--profile <name>\` or \`DSH_PROFILE_DIR\`).
 2. For each plugin, show the packed version vs. the version already installed on this machine.
-3. Ask you, per plugin, whether to install/overwrite it.
+3. By default, automatically install plugins that are newer than the installed version (or not yet installed), and skip same/older versions. Pass \`--confirm\` to be asked about every plugin.
 4. Copy the plugin files, update \`package.json\`, and merge loader patch entries.
 
 Then restart DeepSeek Harness (or reload the profile) for the plugins to activate.
 
-### Non-interactive
+### Options
 
 \`\`\`
-node install.cjs --yes       # install everything
+node install.cjs             # default: auto-install newer/new plugins, skip same/older
+node install.cjs --confirm   # ask [y/N] for every plugin
+node install.cjs --yes       # install everything without asking
 node install.cjs --list      # just show what's in the pack vs. installed
 \`\`\`
 `;
@@ -657,6 +729,44 @@ export function apply(ctx, config) {
             manifestPlugins.push({ name: p.name, version: p.version });
           }
           buildCombinedPatch(selected, join(stage, 'patch'));
+
+          // --- billion-context locally-runnable program: stage runtime payload ---
+          const biliSelected = selected.find(p => p.name === 'billion-context');
+          if (biliSelected) {
+            const biliRuntimeDir = join(__dirname, 'runtime', 'bili');
+            const fetchScript = join(biliRuntimeDir, 'fetch-payload.ps1');
+            const updateScript = join(biliRuntimeDir, 'update.ps1');
+            if (existsSync(fetchScript) && existsSync(updateScript)) {
+              console.log('[dsh-plugin-offline-sync] billion-context selected: fetching runtime payload via fetch-payload.ps1 ...');
+              const fr = run('powershell', [
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', fetchScript,
+                '-Version', biliSelected.version, '-StageOnly',
+              ], { encoding: 'utf8' });
+              if (!fr.ok) {
+                throw new Error('fetch-payload.ps1 failed:\n' + (fr.stderr || fr.stdout));
+              }
+              const m = fr.stdout.match(/STAGE_JSON=(\{[^\r\n]+\})/);
+              if (!m) throw new Error('fetch-payload.ps1 did not emit STAGE_JSON:\n' + fr.stdout);
+              const stageInfo = JSON.parse(m[1]);
+              console.log('[dsh-plugin-offline-sync] billion-context payload staged at: ' + stageInfo.stageDir +
+                ' (version ' + stageInfo.version + (stageInfo.commit ? ', commit ' + stageInfo.commit : '') + ')');
+              const biliOut = join(stage, 'runtime', 'billion-context');
+              mkdirSync(biliOut, { recursive: true });
+              copyFileSync(updateScript, join(biliOut, 'update.ps1'));
+              // payload = the staged npm prefix dir (contains node_modules + shims)
+              copyRecursive(stageInfo.stageDir, join(biliOut, 'payload'));
+              // small manifest for the installer to read version/commit
+              writeFileSync(join(biliOut, 'runtime.json'), JSON.stringify({
+                package: 'billion-context',
+                version: stageInfo.version,
+                commit: stageInfo.commit || '',
+                builtAt: new Date().toISOString(),
+              }, null, 2));
+              try { rmSync(stageInfo.stageDir, { recursive: true, force: true }); } catch {}
+            } else {
+              console.log('[dsh-plugin-offline-sync] warning: billion-context selected but runtime/bili scripts missing; skipping runtime payload.');
+            }
+          }
 
           const manifest = {
             tool: 'dsh-plugin-offline-sync',

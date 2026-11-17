@@ -30,8 +30,15 @@ node install.cjs
 安装器会：
 - 定位 DSH profile（默认 `desktop`，可用 `--profile <name>` 或 `DSH_PROFILE_DIR` 覆盖）
 - 逐个显示打包版本 vs 已安装版本
-- 询问是否安装/覆盖
+- 默认自动安装版本更高的（或目标机未安装的）插件，跳过相同或更旧的版本
+- 加 `--confirm` 可逐个询问是否安装/覆盖
 - 拷贝文件、更新 `package.json`、合并 `cordis.patch.yml`
+
+常用参数：
+- `node install.cjs`：默认，自动安装更新的/新增的插件
+- `node install.cjs --confirm`：逐个询问确认
+- `node install.cjs --yes`：全部安装，不询问
+- `node install.cjs --list`：仅列出打包内容与目标机已装版本对比
 
 重启 DSH 生效。
 
