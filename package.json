@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-offline-sync",
-  "version": "0.2.1",
+  "version": "0.3.1",
   "description": "Package local DSH plugins into a portable ZIP and install them offline on other machines. / 将本地 DSH 插件打包为可便携的 ZIP，在其他机器上离线安装。",
   "type": "module",
   "main": "./index.js",

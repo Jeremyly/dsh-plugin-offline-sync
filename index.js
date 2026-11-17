@@ -800,7 +800,7 @@ export function apply(ctx, config) {
 
           const manifest = {
             tool: 'dsh-plugin-offline-sync',
-            toolVersion: '0.2.1',
+            toolVersion: '0.3.1',
             profile: prof.name,
             packedAt: new Date().toISOString(),
             plugins: manifestPlugins,
