@@ -10,11 +10,13 @@
  * and does NOT depend on the DSH runtime, so it works on machines that have
  * never installed dsh-plugin-offline-sync.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, copyFileSync, createReadStream } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, copyFileSync, createReadStream, createWriteStream } from 'node:fs';
 import { join, dirname, basename, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -22,6 +24,19 @@ const __dirname = dirname(__filename);
 export const name = 'dsh-plugin-offline-sync';
 
 const STATE_FILE = 'pack-state.json';
+
+// --- DSH desktop installer: treated as a virtual, checkable item in the UI. ---
+// The download station (download.deepseek.com) is the authoritative source for
+// the "latest" version: the Content-Disposition header on the installer URL
+// names a file like "deepseek-harness-0.2.2-rc.3-win-x64.exe", which we parse
+// for the version. A HEAD request is enough — no need to download ~300MB.
+const DSH_INSTALLER_VIRTUAL_NAME = '@dsh-installer';
+const DSH_INSTALLER_DIR_NAME = 'dsh-installer';
+const DSH_INSTALLER_STATE_FILE = 'dsh-installer-state.json';
+const DSH_DOWNLOAD_URLS = {
+  win: 'https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe',
+  mac: 'https://download.deepseek.com/desktop/dsh-latest-macos-arm64.dmg',
+};
 
 /**
  * Resolve the profile directory. The market does this by reading
@@ -181,6 +196,157 @@ function loadExcluded(outputDir) {
 function saveExcluded(outputDir, list) {
   mkdirSync(outputDir, { recursive: true });
   writeFileSync(join(outputDir, EXCLUDED_FILE), JSON.stringify(list, null, 2));
+}
+
+// ---- DSH desktop installer helpers ----
+
+/** Parse the DSH version out of a Content-Disposition filename like
+ *  "deepseek-harness-0.2.2-rc.3-win-x64.exe" → "0.2.2-rc.3".
+ *  Returns null if nothing looks like a version. */
+function parseDshVersionFromFilename(filename) {
+  if (!filename) return null;
+  // Strip quotes if present.
+  const m = filename.match(/deepseek-harness[-.]([0-9]+.[0-9]+.[0-9]+(?:[-+][A-Za-z0-9.]+)?)/i);
+  return m ? m[1] : null;
+}
+
+/** Compare two semver-ish versions (handles rc/alpha/beta/empty).
+ *  Returns -1 / 0 / 1, or null if either is unparseable. */
+function cmpDshVersion(a, b) {
+  if (!a || !b) return null;
+  const parse = (v) => {
+    const core = v.split(/[-+]/)[0];
+    const parts = core.split('.').map(Number);
+    if (parts.some(isNaN)) return null;
+    const rest = v.slice(core.length); // e.g. "-rc.3" or ""
+    // Pre-release: present sorts LOWER than absent (0.2.2-rc.3 < 0.2.2).
+    const pre = rest.startsWith('-') ? rest.slice(1) : null;
+    return { parts, pre };
+  };
+  const pa = parse(a), pb = parse(b);
+  if (!pa || !pb) return null;
+  const len = Math.max(pa.parts.length, pb.parts.length);
+  for (let i = 0; i < len; i++) {
+    const x = pa.parts[i] || 0, y = pb.parts[i] || 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  if (pa.pre === pb.pre) return 0;
+  if (pa.pre === null) return 1;   // a is release, b is pre → a newer
+  if (pb.pre === null) return -1;
+  // Semver pre-release precedence: compare dot-separated identifiers left to
+  // right; numeric identifiers compare numerically, others lexically; a
+  // shorter valid prefix sorts lower (rc.3 < rc.3.1).
+  const ia = pa.pre.split('.'), ib = pb.pre.split('.');
+  const plen = Math.max(ia.length, ib.length);
+  for (let i = 0; i < plen; i++) {
+    const xa = ia[i], xb = ib[i];
+    if (xa === undefined) return -1;   // a ran out first → lower
+    if (xb === undefined) return 1;
+    const na = /^[0-9]+$/.test(xa), nb = /^[0-9]+$/.test(xb);
+    if (na && nb) {
+      if (xa !== xb) return Number(xa) < Number(xb) ? -1 : 1;
+    } else if (na !== nb) {
+      return na ? -1 : 1;   // numeric < non-numeric
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+/** HEAD a URL and read Content-Disposition + Content-Length without
+ *  downloading the body. Returns { version, size, filename } or { error }. */
+async function probeRemoteVersion(url) {
+  try {
+    const res = await fetch(url, { method: 'HEAD', redirect: 'follow' });
+    const cd = res.headers.get('content-disposition') || '';
+    const size = Number(res.headers.get('content-length')) || 0;
+    const fm = cd.match(/filename[^;\n=]*=\s*["']?([^"';\n]+)/i);
+    const filename = fm ? fm[1] : '';
+    return { version: parseDshVersionFromFilename(filename), size, filename, status: res.status };
+  } catch (e) {
+    return { error: String(e && e.message || e) };
+  }
+}
+
+/** Detect the locally installed DSH desktop version.
+ *  Win: DeepSeek Harness.exe VersionInfo.FileVersion. Mac: app Info.plist.
+ *  Best-effort; returns null when undetectable. */
+function detectLocalDshVersion() {
+  try {
+    if (process.platform === 'win32') {
+      const candidates = [
+        join(process.env.LOCALAPPDATA || '', 'Programs', 'DeepSeek Harness', 'DeepSeek Harness.exe'),
+        join(process.env.PROGRAMFILES || '', 'DeepSeek Harness', 'DeepSeek Harness.exe'),
+      ];
+      for (const exe of candidates) {
+        if (!existsSync(exe)) continue;
+        // Use powershell only to read version info (no network).
+        const r = spawnSync('powershell', [
+          '-NoProfile', '-Command',
+          "(Get-Item '" + exe.replace(/'/g, "''") + "').VersionInfo.FileVersion",
+        ], { encoding: 'utf8' });
+        const v = (r.stdout || '').trim();
+        if (v) return v;
+      }
+    } else if (process.platform === 'darwin') {
+      const plist = '/Applications/DeepSeek Harness.app/Contents/Info.plist';
+      if (existsSync(plist)) {
+        const r = spawnSync('defaults', ['read', plist, 'CFBundleShortVersionString'], { encoding: 'utf8' });
+        const v = (r.stdout || '').trim();
+        if (v) return v;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function dshInstallerDir(outputDir) {
+  return join(outputDir, DSH_INSTALLER_DIR_NAME);
+}
+
+function loadDshInstallerState(outputDir) {
+  const p = join(outputDir, DSH_INSTALLER_STATE_FILE);
+  if (!existsSync(p)) return {};
+  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return {}; }
+}
+
+function saveDshInstallerState(outputDir, state) {
+  mkdirSync(outputDir, { recursive: true });
+  writeFileSync(join(outputDir, DSH_INSTALLER_STATE_FILE), JSON.stringify(state, null, 2));
+}
+
+/** Stream-download an installer to <outputDir>/dsh-installer/<filename>.
+ *  Existing older files for the same platform are removed first.
+ *  Returns { ok, path, filename, version, size }. */
+async function downloadDshInstaller(outputDir, platform) {
+  const url = DSH_DOWNLOAD_URLS[platform];
+  if (!url) return { ok: false, error: 'unknown platform: ' + platform };
+  const probe = await probeRemoteVersion(url);
+  if (probe.error) return { ok: false, error: probe.error };
+  if (!probe.version) return { ok: false, error: 'could not detect latest version from ' + url };
+  const dir = dshInstallerDir(outputDir);
+  mkdirSync(dir, { recursive: true });
+  const ext = platform === 'win' ? '.exe' : '.dmg';
+  const filename = 'deepseek-harness-' + probe.version + '-' + platform + ext;
+  const dest = join(dir, filename);
+  // Remove any stale installer for this platform.
+  for (const ent of readdirSync(dir, { withFileTypes: true })) {
+    if (ent.isFile() && ent.name.endsWith(ext) && ent.name !== filename) {
+      try { rmSync(join(dir, ent.name), { force: true }); } catch {}
+    }
+  }
+  const tmp = dest + '.part';
+  if (existsSync(tmp)) rmSync(tmp, { force: true });
+  const res = await fetch(url, { redirect: 'follow' });
+  if (!res.ok || !res.body) {
+    return { ok: false, error: 'download failed: HTTP ' + res.status };
+  }
+  await pipeline(Readable.fromWeb(res.body), createWriteStream(tmp));
+  if (existsSync(dest)) rmSync(dest, { force: true });
+  copyFileSync(tmp, dest);
+  rmSync(tmp, { force: true });
+  return { ok: true, path: dest, filename, version: probe.version, size: probe.size || statSync(dest).size };
 }
 
 /**
@@ -872,6 +1038,102 @@ export function apply(ctx, config) {
       },
     }));
 
+    // GET /dsh-plugin-offline-sync/dsh-version — detect the latest DSH desktop
+    // installer version from the download station via a HEAD request (no body
+    // download) and compare it against the last-downloaded version recorded in
+    // the output dir state. Also reports the locally installed DSH version
+    // (best-effort). The download station is the authoritative "latest" source.
+    routes.push(webServer.register({
+      kind: 'exact',
+      path: '/dsh-plugin-offline-sync/dsh-version',
+      handler: async (req, res) => {
+        try {
+          const outputDir = defaultOutputDir();
+          const state = loadDshInstallerState(outputDir);
+          const localVersion = detectLocalDshVersion();
+          const platforms = [];
+          for (const key of Object.keys(DSH_DOWNLOAD_URLS)) {
+            const probe = await probeRemoteVersion(DSH_DOWNLOAD_URLS[key]);
+            const dir = dshInstallerDir(outputDir);
+            const ext = key === 'win' ? '.exe' : '.dmg';
+            let files = [];
+            if (existsSync(dir)) {
+              files = readdirSync(dir, { withFileTypes: true })
+                .filter(e => e.isFile() && e.name.endsWith(ext))
+                .map(e => e.name);
+            }
+            const last = state[key] || null;
+            const cmp = (probe.version && last && last.version) ? cmpDshVersion(probe.version, last.version) : null;
+            const neverDownloaded = !last || !last.version;
+            platforms.push({
+              key,
+              url: DSH_DOWNLOAD_URLS[key],
+              latestVersion: probe.version || null,
+              latestSize: probe.size || 0,
+              filename: probe.filename || null,
+              error: probe.error || null,
+              lastDownloadedVersion: last ? last.version : null,
+              lastDownloadedAt: last ? (last.downloadedAt || null) : null,
+              hasUpdate: !neverDownloaded && cmp === 1,
+              files,
+            });
+          }
+          json(res, 200, { outputDir, localVersion, platforms });
+        } catch (e) {
+          json(res, 500, { error: String(e && e.message || e) });
+        }
+      },
+    }));
+
+    // POST /dsh-plugin-offline-sync/download-dsh — download the latest DSH
+    // installer(s) for the requested platforms into <outputDir>/dsh-installer/.
+    // This is a standalone job, separate from plugin packing: installers are
+    // NOT put into the ZIP. Re-checking a platform (force:true) re-downloads
+    // even if the recorded version already matches the remote latest.
+    // body: { outputDir?: string, platforms: ('win'|'mac')[], force?: boolean }
+    routes.push(webServer.register({
+      kind: 'exact',
+      path: '/dsh-plugin-offline-sync/download-dsh',
+      handler: async (req, res) => {
+        try {
+          const body = await readBody(req);
+          const outputDir = (body && body.outputDir) || defaultOutputDir();
+          const requested = Array.isArray(body && body.platforms) ? body.platforms : [];
+          const forcePlats = Array.isArray(body && body.forcePlatforms) ? body.forcePlatforms : [];
+          const force = !!(body && body.force);
+          if (requested.length === 0) {
+            json(res, 400, { error: 'no platforms requested' });
+            return;
+          }
+          const state = loadDshInstallerState(outputDir);
+          const results = [];
+          for (const key of requested) {
+            if (!DSH_DOWNLOAD_URLS[key]) {
+              results.push({ platform: key, ok: false, error: 'unknown platform' });
+              continue;
+            }
+            const probe = await probeRemoteVersion(DSH_DOWNLOAD_URLS[key]);
+            const last = state[key] || null;
+            const forced = force || forcePlats.indexOf(key) !== -1;
+            if (!forced && probe.version && last && last.version &&
+                cmpDshVersion(probe.version, last.version) === 0) {
+              results.push({ platform: key, ok: true, skipped: true, version: last.version, path: last.path || null, filename: last.filename || null });
+              continue;
+            }
+            const dl = await downloadDshInstaller(outputDir, key);
+            if (dl.ok) {
+              state[key] = { version: dl.version, path: dl.path, filename: dl.filename, downloadedAt: Date.now() };
+              saveDshInstallerState(outputDir, state);
+            }
+            results.push({ platform: key, ...dl });
+          }
+          json(res, 200, { ok: results.every(r => r.ok), results });
+        } catch (e) {
+          json(res, 500, { error: String(e && e.stack || e) });
+        }
+      },
+    }));
+
     // POST /dsh-plugin-offline-sync/copy-last — copy the most recent ZIP archive
     // (and its same-basename .txt packing list) to the system clipboard.
     // body: { outputDir?: string }
@@ -906,6 +1168,19 @@ export function apply(ctx, config) {
           const files = [zipPath];
           const hasTxt = existsSync(txtPath);
           if (hasTxt) files.push(txtPath);
+          // Include any downloaded DSH installer files (separate job, but the
+          // copy action bundles them together for easy transfer).
+          const installerFiles = [];
+          const instDir = dshInstallerDir(outputDir);
+          if (existsSync(instDir)) {
+            for (const ent of readdirSync(instDir, { withFileTypes: true })) {
+              if (ent.isFile() && /\.(exe|dmg)$/i.test(ent.name)) {
+                const p = join(instDir, ent.name);
+                installerFiles.push(p);
+                files.push(p);
+              }
+            }
+          }
           const cr = copyFilesToClipboard(files);
           if (!cr.ok) {
             json(res, 500, { error: 'clipboard copy failed', stdout: cr.stdout, stderr: cr.stderr, platform: process.platform });
@@ -915,6 +1190,7 @@ export function apply(ctx, config) {
             ok: true,
             zipName: latest.name,
             txtName: hasTxt ? txtName : null,
+            installerFiles,
             files,
           });
         } catch (e) {
@@ -1012,14 +1288,31 @@ export function apply(ctx, config) {
               try { rmSync(join(outputDir, ent.name), { force: true }); deleted++; } catch {}
             }
           }
+          // Also clear downloaded DSH installers (separate job, but history
+          // cleanup removes them together). Count removed installer files.
+          let installerDeleted = 0;
+          const instDir = dshInstallerDir(outputDir);
+          if (existsSync(instDir)) {
+            try {
+              const instEntries = readdirSync(instDir, { withFileTypes: true });
+              for (const ent of instEntries) {
+                if (ent.isFile()) { try { rmSync(join(instDir, ent.name), { force: true }); installerDeleted++; } catch {} }
+              }
+              rmSync(instDir, { recursive: true, force: true });
+            } catch {}
+          }
           let stateCleared = false;
           if (resetState) {
             const statePath = join(outputDir, STATE_FILE);
             if (existsSync(statePath)) {
               try { rmSync(statePath, { force: true }); stateCleared = true; } catch {}
             }
+            const instStatePath = join(outputDir, DSH_INSTALLER_STATE_FILE);
+            if (existsSync(instStatePath)) {
+              try { rmSync(instStatePath, { force: true }); } catch {}
+            }
           }
-          json(res, 200, { ok: true, deleted, stateCleared });
+          json(res, 200, { ok: true, deleted, installerDeleted, stateCleared });
         } catch (e) {
           json(res, 500, { error: String(e && e.message || e) });
         }

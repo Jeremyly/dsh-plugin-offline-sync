@@ -63,7 +63,16 @@ window.__ModuleLoader__.load({
         '.dsh-sync-help{margin-top:18px;padding:16px 20px;background:var(--dsw-alias-bg-module-sub,#f9fafb);border-radius:14px;font-size:12px;color:var(--dsw-alias-label-secondary,#475569);border:1px solid var(--dsw-alias-border-l2,#e2e8f0)}',
         '.dsh-sync-help h4{margin:0 0 10px;font-size:13px;color:var(--dsw-alias-label-primary,#17212b)}',
         '.dsh-sync-help ol{margin:0;padding-left:20px;line-height:1.9}',
-        '.dsh-sync-help code{background:var(--dsw-alias-bg-code,#e5e7eb);padding:1px 6px;border-radius:4px;font-size:11px}'
+        '.dsh-sync-help code{background:var(--dsw-alias-bg-code,#e5e7eb);padding:1px 6px;border-radius:4px;font-size:11px}',
+        '.dsh-sync-item.dsh-installer{padding-left:46px;border-color:var(--dsw-alias-brand-primary,#2563eb);background:linear-gradient(135deg,rgba(37,99,235,.05),rgba(124,58,237,.03));cursor:pointer}',
+        '.dsh-sync-item.dsh-installer:hover{transform:none}',
+        '.dsh-sync-dsh-platforms{display:flex;flex-wrap:wrap;gap:7px;margin-top:4px}',
+        '.dsh-sync-dsh-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 12px;border:1px solid var(--dsw-alias-border-l2,#e2e8f0);border-radius:8px;background:var(--dsw-alias-bg-module-sub,#f9fafb);color:var(--dsw-alias-label-secondary,#475569);font-size:12px;font-family:inherit;font-weight:500;cursor:pointer;line-height:1.6;transition:all .15s;white-space:nowrap;width:auto;box-sizing:border-box;user-select:none}',
+        '.dsh-sync-dsh-chip:hover{border-color:var(--dsw-alias-brand-primary,#2563eb)}',
+        '.dsh-sync-dsh-chip.on{background:var(--dsw-alias-brand-primary,#2563eb);border-color:var(--dsw-alias-brand-primary,#2563eb);color:#fff}',
+        '.dsh-sync-dsh-chip-dot{font-size:8px;color:var(--dsw-alias-color-warning,#f59e0b)}',
+        '.dsh-sync-dsh-chip.on .dsh-sync-dsh-chip-dot{color:#fde68a}',
+        '.dsh-sync-dsh-chip-err{font-size:10px;color:var(--dsw-alias-color-error,#dc2626);font-weight:700}'
       ].join('\n');
       document.head.appendChild(styleEl);
     }
@@ -78,17 +87,44 @@ window.__ModuleLoader__.load({
       var _g = React.useState(false), packing = _g[0], setPacking = _g[1];
       var _h = React.useState(false), clearing = _h[0], setClearing = _h[1];
       var _i = React.useState(false), copying = _i[0], setCopying = _i[1];
+      var _j = React.useState(null), dshVersion = _j[0], setDshVersion = _j[1];
+      var _k = React.useState(false), dshSelected = _k[0], setDshSelected = _k[1];
+      var _l = React.useState({}), dshPlatforms = _l[0], setDshPlatforms = _l[1];
+      var _m = React.useState({}), dshManual = _m[0], setDshManual = _m[1];
 
       React.useEffect(function () { ensureStyles(); load(); }, []);
 
+      function currentPlatform() {
+        var pf = (navigator.platform || '').toLowerCase();
+        var ua = (navigator.userAgent || '').toLowerCase();
+        if (pf.indexOf('win') !== -1 || ua.indexOf('windows') !== -1) return 'win';
+        if (pf.indexOf('mac') !== -1 || ua.indexOf('mac os') !== -1) return 'mac';
+        return 'win';
+      }
+
       function load() {
         setLoading(true); setError('');
-        fetch('/dsh-plugin-offline-sync/plugins').then(function (r) { return r.json(); }).then(function (d) {
+        Promise.all([
+          fetch('/dsh-plugin-offline-sync/plugins').then(function (r) { return r.json(); }),
+          fetch('/dsh-plugin-offline-sync/dsh-version').then(function (r) { return r.json(); }).catch(function () { return null; })
+        ]).then(function (results) {
+          var d = results[0], dv = results[1];
           setData(d);
           setOutputDir(d.outputDir);
           var sel = {};
           (d.plugins || []).forEach(function (p) { if (p.changed) sel[p.name] = true; });
           setSelected(sel);
+          if (dv && dv.platforms) {
+            setDshVersion(dv);
+            var cur = currentPlatform();
+            var plats = {};
+            (dv.platforms || []).forEach(function (p) {
+              plats[p.key] = (p.key === cur);
+            });
+            setDshPlatforms(plats);
+            setDshSelected(false);
+            setDshManual({});
+          }
           setLoading(false);
         }).catch(function (e) { setError(String(e)); setLoading(false); });
       }
@@ -113,24 +149,55 @@ window.__ModuleLoader__.load({
         setSelected(sel);
       }
 
-      function selectNone() { setSelected({}); }
+      function selectNone() { setSelected({}); setDshSelected(false); }
 
       function pack() {
         var names = Object.keys(selected);
-        if (names.length === 0) { setError('请先选择要打包的插件'); return; }
+        var dshPlats = dshSelected ? Object.keys(dshPlatforms).filter(function (k) { return dshPlatforms[k]; }) : [];
+        if (names.length === 0 && dshPlats.length === 0) {
+          setError('请先选择要打包的插件，或勾选 DSH 安装包');
+          return;
+        }
         setPacking(true); setError(''); setInfo('');
-        fetch('/dsh-plugin-offline-sync/pack', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ names: names, outputDir: outputDir || undefined }),
-        }).then(function (r) { return r.json(); }).then(function (d) {
+        var jobs = [];
+        if (dshPlats.length > 0) {
+          var forcePlats = dshPlats.filter(function (k) { return dshManual[k]; });
+          jobs.push(fetch('/dsh-plugin-offline-sync/download-dsh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ platforms: dshPlats, forcePlatforms: forcePlats, outputDir: outputDir || undefined }),
+          }).then(parseResp).then(function (d) { return { kind: 'dsh', data: d }; }));
+        }
+        if (names.length > 0) {
+          jobs.push(fetch('/dsh-plugin-offline-sync/pack', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ names: names, outputDir: outputDir || undefined }),
+          }).then(function (r) { return r.json(); }).then(function (d) { return { kind: 'pack', data: d }; }));
+        }
+        Promise.all(jobs).then(function (outs) {
           setPacking(false);
-          if (d.ok) {
-            setInfo('打包完成: ' + d.zipName + '\n路径: ' + d.zipPath);
-            load();
-          } else {
-            setError(d.error || '打包失败');
-          }
+          var infoLines = [], hasError = false;
+          outs.forEach(function (o) {
+            if (o.kind === 'pack') {
+              if (o.data.ok) infoLines.push('打包完成: ' + o.data.zipName + '\n路径: ' + o.data.zipPath);
+              else { hasError = true; infoLines.push('打包失败: ' + (o.data.error || '')); }
+            } else if (o.kind === 'dsh') {
+              if (o.data.ok) {
+                infoLines.push('DSH 安装包：');
+                (o.data.results || []).forEach(function (r) {
+                  var label = r.platform === 'win' ? 'Windows (.exe)' : 'macOS (.dmg)';
+                  if (r.skipped) infoLines.push('• ' + label + '：已是最新 v' + r.version + '（跳过）');
+                  else if (r.ok) infoLines.push('• ' + label + '：已下载 v' + r.version);
+                  else infoLines.push('• ' + label + '：失败 ' + (r.error || ''));
+                });
+              } else { hasError = true; infoLines.push('安装包下载失败: ' + (o.data.error || '')); }
+            }
+          });
+          if (hasError) setError(infoLines.join('\n'));
+          else setInfo(infoLines.join('\n'));
+          setDshManual({});
+          load();
         }).catch(function (e) { setError(String(e)); setPacking(false); });
       }
 
@@ -149,11 +216,25 @@ window.__ModuleLoader__.load({
           if (d.ok) {
             var msg = '已复制最近的打包结果到剪贴板：\n' + d.zipName;
             if (d.txtName) msg += '\n' + d.txtName;
+            if (d.installerFiles && d.installerFiles.length) {
+              msg += '\n\n同时复制了 ' + d.installerFiles.length + ' 个 DSH 安装包：';
+              d.installerFiles.forEach(function (f) { var parts = f.split(/[\\/]/); msg += '\n• ' + parts[parts.length - 1]; });
+            }
             setInfo(msg);
           } else {
             setError(d.error || '复制失败');
           }
         }).catch(function (e) { setError(String(e)); setCopying(false); });
+      }
+
+      function toggleDshPlatform(key) {
+        setDshPlatforms(function (s) { var next = Object.assign({}, s); next[key] = !next[key]; return next; });
+        // A manual toggle forces a re-download even if the version already matches.
+        setDshManual(function (m) { var n = Object.assign({}, m); n[key] = true; return n; });
+      }
+
+      function toggleDshCard() {
+        setDshSelected(function (v) { return !v; });
       }
 
       function excludePlugin(name) {
@@ -206,6 +287,7 @@ window.__ModuleLoader__.load({
             setClearing(false);
             if (d.ok) {
               var msg = '已清除历史：删除 ' + (d.deleted || 0) + ' 个 ZIP 文件';
+              if (d.installerDeleted) msg += '、' + d.installerDeleted + ' 个 DSH 安装包';
               if (resetState && d.stateCleared) msg += '，已重置"有更新"检测状态';
               setInfo(msg);
               load();
@@ -368,6 +450,82 @@ window.__ModuleLoader__.load({
 
       var plugins = (data && data.plugins) || [];
       var count = Object.keys(selected).length;
+      var dshReady = dshSelected && Object.keys(dshPlatforms).filter(function (k) { return dshPlatforms[k]; }).length > 0;
+
+      function renderDshCard() {
+        if (!dshVersion || !dshVersion.platforms) return null;
+        var plats = dshVersion.platforms || [];
+        var anyUpdate = plats.some(function (p) { return p.hasUpdate; });
+        var latest = plats[0] && plats[0].latestVersion;
+        var selPlats = plats.filter(function (p) { return dshPlatforms[p.key]; });
+        return h('div', {
+          key: '@dsh-installer',
+          onClick: toggleDshCard,
+          className: 'dsh-sync-item dsh-installer' + (dshSelected ? ' selected' : '')
+        },
+          h('input', { type: 'checkbox', checked: dshSelected, onChange: function () {} }),
+          h('div', { className: 'dsh-sync-item-main' },
+            h('div', { className: 'dsh-sync-item-name' },
+              'DSH 安装包',
+              latest ? h('span', { className: 'dsh-sync-badge version' }, latest) : null,
+              anyUpdate ? h('span', { className: 'dsh-sync-badge changed' }, '有更新') : null
+            ),
+            h('div', { className: 'dsh-sync-dsh-platforms', onClick: function (e) { e.stopPropagation(); } },
+              plats.map(function (p) {
+                var on = !!dshPlatforms[p.key];
+                var label = p.key === 'win' ? 'Windows' : 'macOS';
+                var tip = [];
+                if (p.latestVersion) tip.push('最新 ' + p.latestVersion);
+                if (p.latestSize) tip.push(Math.round(p.latestSize / 1048576) + 'MB');
+                if (p.lastDownloadedVersion) tip.push('已下 v' + p.lastDownloadedVersion);
+                if (dshVersion.localVersion && p.key === currentPlatform()) tip.push('本机 v' + dshVersion.localVersion);
+                return h('span', {
+                  key: p.key,
+                  className: 'dsh-sync-dsh-chip' + (on ? ' on' : ''),
+                  title: tip.join(' · ') || label,
+                  onClick: function (e) { e.stopPropagation(); toggleDshPlatform(p.key); }
+                },
+                  label,
+                  p.hasUpdate ? h('span', { className: 'dsh-sync-dsh-chip-dot' }, '●') : null,
+                  p.error ? h('span', { className: 'dsh-sync-dsh-chip-err' }, '!') : null
+                );
+              })
+            ),
+            selPlats.length === 0 ? h('div', { className: 'dsh-sync-item-desc', style: { marginTop: 2 } }, '勾选平台后点「开始打包」即下载安装包') : null
+          )
+        );
+      }
+
+      var gridItems = [];
+      if (loading) {
+        gridItems.push(h('div', { className: 'dsh-sync-empty' }, '加载中...'));
+      } else {
+        if (dshVersion && dshVersion.platforms) gridItems.push(renderDshCard());
+        plugins.forEach(function (p) {
+          var checked = !!selected[p.name];
+          gridItems.push(h('div', {
+            key: p.name,
+            onClick: function () { toggle(p.name); },
+            className: 'dsh-sync-item' + (checked ? ' selected' : '')
+          },
+            h('input', { type: 'checkbox', checked: checked, onChange: function () {} }),
+            h('button', {
+              className: 'dsh-sync-exclude-btn',
+              title: '排除此插件',
+              onClick: function (e) { e.stopPropagation(); excludePlugin(p.name); }
+            }, '\u2298'),
+            h('div', { className: 'dsh-sync-item-main' },
+              h('div', { className: 'dsh-sync-item-name' },
+                p.name,
+                p.version ? h('span', { className: 'dsh-sync-badge version' }, p.version) : null,
+                p.changed ? h('span', { className: 'dsh-sync-badge changed' }, '有更新') : null
+              ),
+              p.description ? h('div', { className: 'dsh-sync-item-desc' }, p.description) : null
+            )
+          ));
+        });
+        if (gridItems.length === 0) gridItems.push(h('div', { className: 'dsh-sync-empty' }, '未发现插件'));
+      }
 
       return h('div', { className: 'dsh-sync-root' },
         h('div', { className: 'dsh-sync-header' },
@@ -403,7 +561,7 @@ window.__ModuleLoader__.load({
               h('button', { className: 'dsh-sync-btn', onClick: openDirDialog }, '📁 输出目录'),
               h('button', {
                 onClick: pack,
-                disabled: packing || count === 0,
+                disabled: packing || (count === 0 && !dshReady),
                 className: 'dsh-sync-btn primary'
               }, packing ? '打包中...' : '开始打包')
             )
@@ -412,33 +570,7 @@ window.__ModuleLoader__.load({
           error && h('div', { className: 'dsh-sync-alert error' }, error),
           info && h('div', { className: 'dsh-sync-alert success' }, info),
 
-          h('div', { className: 'dsh-sync-grid' },
-            loading ? h('div', { className: 'dsh-sync-empty' }, '加载中...') :
-            plugins.length === 0 ? h('div', { className: 'dsh-sync-empty' }, '未发现插件') :
-            plugins.map(function (p) {
-              var checked = !!selected[p.name];
-              return h('div', {
-                key: p.name,
-                onClick: function () { toggle(p.name); },
-                className: 'dsh-sync-item' + (checked ? ' selected' : '')
-              },
-                h('input', { type: 'checkbox', checked: checked, onChange: function () {} }),
-                h('button', {
-                  className: 'dsh-sync-exclude-btn',
-                  title: '排除此插件',
-                  onClick: function (e) { e.stopPropagation(); excludePlugin(p.name); }
-                }, '⊘'),
-                h('div', { className: 'dsh-sync-item-main' },
-                  h('div', { className: 'dsh-sync-item-name' },
-                    p.name,
-                    p.version ? h('span', { className: 'dsh-sync-badge version' }, p.version) : null,
-                    p.changed ? h('span', { className: 'dsh-sync-badge changed' }, '有更新') : null
-                  ),
-                  p.description ? h('div', { className: 'dsh-sync-item-desc' }, p.description) : null
-                )
-              );
-            })
-          ),
+          h('div', { className: 'dsh-sync-grid' }, gridItems),
 
           (function () {
             var excluded = (data && data.excluded) || [];
